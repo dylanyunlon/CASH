@@ -3,31 +3,31 @@
 #ifndef CRUCIBLE_WORKLOAD_PARTITIONER_CUH
 #define CRUCIBLE_WORKLOAD_PARTITIONER_CUH
 
-/// Crucible Workload Partitioner
-///
-/// Adapts PIM-ANNS's per-core fine-grained scheduling to heterogeneous
-/// GPU clusters.  The fundamental problem:
-///
-///   Given a mixed workload W = {embedding_lookup, gradient_update},
-///   and devices D = {H100 (fast, few), A6000×2 (slower, more)},
-///   find assignment A: W → D that minimises max_d∈D T(A, d).
-///
-/// This is a weighted load-balancing problem where device throughput
-/// is workload-dependent (H100's HBM3 advantage is larger for
-/// bandwidth-bound lookups than compute-bound gradient updates).
-///
-/// The partitioner:
-///   1. Calibrates each device with micro-benchmarks (Calibration kernel)
-///   2. Builds a per-device cost model
-///   3. Solves the partition via a greedy bisection on the objective
-///
-/// The calibration kernel measures two metrics per device:
-///   - Embedding lookup throughput (random-access reads)
-///   - Gradient scatter throughput (random-access writes + atomics)
-///
-/// These are measured in-situ because they depend on the actual
-/// memory system behaviour (cache hierarchy, TLB, bank conflicts),
-/// not just peak bandwidth numbers from the spec sheet.
+// Crucible Workload Partitioner
+//
+// Adapts PIM-ANNS's per-core fine-grained scheduling to heterogeneous
+// GPU clusters.  The fundamental problem:
+//
+//   Given a mixed workload W = {embedding_lookup, gradient_update},
+//   and devices D = {H100 (fast, few), A6000×2 (slower, more)},
+//   find assignment A: W → D that minimises max_d∈D T(A, d).
+//
+// This is a weighted load-balancing problem where device throughput
+// is workload-dependent (H100's HBM3 advantage is larger for
+// bandwidth-bound lookups than compute-bound gradient updates).
+//
+// The partitioner:
+//   1. Calibrates each device with micro-benchmarks (Calibration kernel)
+//   2. Builds a per-device cost model
+//   3. Solves the partition via a greedy bisection on the objective
+//
+// The calibration kernel measures two metrics per device:
+//   - Embedding lookup throughput (random-access reads)
+//   - Gradient scatter throughput (random-access writes + atomics)
+//
+// These are measured in-situ because they depend on the actual
+// memory system behaviour (cache hierarchy, TLB, bank conflicts),
+// not just peak bandwidth numbers from the spec sheet.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -244,7 +244,7 @@ inline PartitionPlan solve_partition(
     return plan;
 }
 
-/// Uniform partition (baseline comparison)
+// Uniform partition (baseline comparison)
 inline PartitionPlan solve_uniform(
     const DeviceProfile* profiles,
     int                  num_devices,

@@ -3,27 +3,27 @@
 #ifndef CRUCIBLE_DIFFERENTIAL_VALIDATOR_CUH
 #define CRUCIBLE_DIFFERENTIAL_VALIDATOR_CUH
 
-/// Crucible Differential Validator
-///
-/// Adapts SyzMini's influence-guided test reduction to CUDA kernel
-/// parameter space.  The core idea:
-///
-///   For each kernel K, run K on sm86 and sm90 with identical inputs.
-///   Compare outputs.  Track which *parameters* (grid dim, block dim,
-///   shared mem, alignment, tensor shape) most influence divergence.
-///   Focus subsequent fuzzing on high-influence parameter regions.
-///
-/// The influence score is an exponentially-weighted moving average:
-///   score[param] = α·caused_divergence + (1-α)·score[param]
-///
-/// Parameters with high influence scores are mutated more aggressively
-/// in subsequent rounds (wider perturbation range, boundary-biased
-/// sampling).
-///
-/// This file provides the device-side kernels for:
-///   1. Test execution wrappers (run-and-capture)
-///   2. Bitwise comparison
-///   3. Influence-weighted boundary generation
+// Crucible Differential Validator
+//
+// Adapts SyzMini's influence-guided test reduction to CUDA kernel
+// parameter space.  The core idea:
+//
+//   For each kernel K, run K on sm86 and sm90 with identical inputs.
+//   Compare outputs.  Track which *parameters* (grid dim, block dim,
+//   shared mem, alignment, tensor shape) most influence divergence.
+//   Focus subsequent fuzzing on high-influence parameter regions.
+//
+// The influence score is an exponentially-weighted moving average:
+//   score[param] = α·caused_divergence + (1-α)·score[param]
+//
+// Parameters with high influence scores are mutated more aggressively
+// in subsequent rounds (wider perturbation range, boundary-biased
+// sampling).
+//
+// This file provides the device-side kernels for:
+//   1. Test execution wrappers (run-and-capture)
+//   2. Bitwise comparison
+//   3. Influence-weighted boundary generation
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -49,16 +49,76 @@ struct DivergenceReport {
     uint32_t first_mismatch_idx;
 };
 
-template <typename T, int BLOCK_THREADS = 256>
-__global__ void BitwiseCompareKernel(
-    const T*           __restrict__ d_output_a,   // sm86 output
-    const T*           __restrict__ d_output_b,   // sm90 output
+// ─────────────────────────────────────────────────────────────────
+//  reduce_divergence_stats — warp-level reduction + global write
+//
+//  Factored out of the compare kernel so that all three comparison
+//  strategies share the same reduction code (DRY).  This mirrors
+//  how CUB factors process_range separately from the lambdas.
+// ─────────────────────────────────────────────────────────────────
+
+__device__ __forceinline__
+void reduce_divergence_stats(
+    float     local_abs_max,
+    float     local_rel_max,
+    uint32_t  local_mismatches,
+    uint32_t  local_first_idx,
+    DivergenceReport* __restrict__ d_report)
+{
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_abs_max    = fmaxf(local_abs_max,
+                                 __shfl_down_sync(0xFFFFFFFF, local_abs_max, offset));
+        local_rel_max    = fmaxf(local_rel_max,
+                                 __shfl_down_sync(0xFFFFFFFF, local_rel_max, offset));
+        local_mismatches += __shfl_down_sync(0xFFFFFFFF, local_mismatches, offset);
+        local_first_idx  = min(local_first_idx,
+                               __shfl_down_sync(0xFFFFFFFF, local_first_idx, offset));
+    }
+
+    if ((threadIdx.x & 31) == 0)
+    {
+        atomicAdd(&d_report->mismatched_elements, local_mismatches);
+        atomicMax(reinterpret_cast<int*>(&d_report->max_abs_diff),
+                  __float_as_int(local_abs_max));
+        atomicMax(reinterpret_cast<int*>(&d_report->max_rel_diff),
+                  __float_as_int(local_rel_max));
+        atomicMin(&d_report->first_mismatch_idx, local_first_idx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  compare_range — generic element-pair processor
+//
+//  Mirrors CUB's process_range: iterates over a tile of element
+//  pairs and invokes a caller-supplied lambda on each (a, b, i).
+//  The lambda returns true if the pair is a "mismatch" under its
+//  particular comparison strategy.
+//
+//  Three strategies (paralleling CUB's three filter lambdas):
+//
+//    f_bitwise:      Reinterpret-cast to same-sized integer, compare
+//                    bits.  Catches NaN payloads, sign-bit flips.
+//                    (analogous to f_early_stop: strictest, no output)
+//
+//    f_ulp_bounded:  Compute ULP distance, accept if ≤ tolerance.
+//                    (analogous to f_with_out_buf: filter + histogram)
+//
+//    f_relative:     Accept if |a-b|/max(|a|,ε) ≤ tolerance.
+//                    (analogous to f_no_out_buf: loosest, histogram only)
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T, int BLOCK_THREADS, typename CompareF>
+__device__ __forceinline__
+void compare_range(
+    const T*           __restrict__ d_a,
+    const T*           __restrict__ d_b,
     uint32_t                        num_elements,
+    CompareF&&                      is_mismatch,
     DivergenceReport*  __restrict__ d_report)
 {
-    // Per-thread local maximums
-    float local_abs_max = 0.0f;
-    float local_rel_max = 0.0f;
+    float    local_abs_max    = 0.0f;
+    float    local_rel_max   = 0.0f;
     uint32_t local_mismatches = 0;
     uint32_t local_first_idx  = UINT32_MAX;
 
@@ -66,30 +126,10 @@ __global__ void BitwiseCompareKernel(
          i < num_elements;
          i += gridDim.x * BLOCK_THREADS)
     {
-        const T a = d_output_a[i];
-        const T b = d_output_b[i];
+        const T a = d_a[i];
+        const T b = d_b[i];
 
-        // Bitwise comparison: reinterpret as same-sized integer
-        // This catches sign-bit flips and NaN payload differences
-        // that floating-point == would miss.
-        bool bitwise_equal;
-        if constexpr (sizeof(T) == 4)
-        {
-            bitwise_equal = (__float_as_int(static_cast<float>(a)) ==
-                             __float_as_int(static_cast<float>(b)));
-        }
-        else if constexpr (sizeof(T) == 2)
-        {
-            bitwise_equal = (*reinterpret_cast<const uint16_t*>(&a) ==
-                             *reinterpret_cast<const uint16_t*>(&b));
-        }
-        else
-        {
-            bitwise_equal = (*reinterpret_cast<const uint8_t*>(&a) ==
-                             *reinterpret_cast<const uint8_t*>(&b));
-        }
-
-        if (!bitwise_equal)
+        if (is_mismatch(a, b, i))
         {
             ++local_mismatches;
             if (i < local_first_idx) local_first_idx = i;
@@ -104,27 +144,91 @@ __global__ void BitwiseCompareKernel(
         }
     }
 
-    // ── Warp-level reduction ──────────────────────────────────
-    for (int offset = 16; offset > 0; offset >>= 1)
-    {
-        local_abs_max    = fmaxf(local_abs_max,
-                                 __shfl_down_sync(0xFFFFFFFF, local_abs_max, offset));
-        local_rel_max    = fmaxf(local_rel_max,
-                                 __shfl_down_sync(0xFFFFFFFF, local_rel_max, offset));
-        local_mismatches += __shfl_down_sync(0xFFFFFFFF, local_mismatches, offset);
-        local_first_idx  = min(local_first_idx,
-                               __shfl_down_sync(0xFFFFFFFF, local_first_idx, offset));
-    }
+    reduce_divergence_stats(local_abs_max, local_rel_max,
+                            local_mismatches, local_first_idx, d_report);
+}
 
-    // ── Lane 0 of each warp writes to global report ──────────
-    if ((threadIdx.x & 31) == 0)
+// ─────────────────────────────────────────────────────────────────
+//  DifferentialCompareKernel
+//
+//  Dispatches one of three comparison strategies based on the
+//  tolerance_mode parameter.  The strategy selection at runtime
+//  mirrors CUB's if(early_stop) / else if(out_buf) / else pattern:
+//  the kernel is the same, but the lambda captures different logic.
+// ─────────────────────────────────────────────────────────────────
+
+enum class CompareMode : int {
+    BITWISE     = 0,   // exact bit equality (strictest)
+    ULP_BOUNDED = 1,   // within N ULP tolerance
+    RELATIVE    = 2,   // within relative error bound (loosest)
+};
+
+template <typename T, int BLOCK_THREADS = 256>
+__global__ void DifferentialCompareKernel(
+    const T*           __restrict__ d_output_a,
+    const T*           __restrict__ d_output_b,
+    uint32_t                        num_elements,
+    DivergenceReport*  __restrict__ d_report,
+    CompareMode                     mode,
+    float                           tolerance)
+{
+    // Lambda: bitwise comparison.
+    // Reinterpret as integer — catches NaN payloads, signed zeros.
+    auto f_bitwise = [](const T& a, const T& b, uint32_t /*i*/) -> bool {
+        if constexpr (sizeof(T) == 4)
+        {
+            return __float_as_int(static_cast<float>(a)) !=
+                   __float_as_int(static_cast<float>(b));
+        }
+        else if constexpr (sizeof(T) == 2)
+        {
+            return *reinterpret_cast<const uint16_t*>(&a) !=
+                   *reinterpret_cast<const uint16_t*>(&b);
+        }
+        else
+        {
+            return *reinterpret_cast<const uint8_t*>(&a) !=
+                   *reinterpret_cast<const uint8_t*>(&b);
+        }
+    };
+
+    // Lambda: ULP-bounded comparison.
+    // Mismatch iff ULP distance exceeds tolerance.
+    auto f_ulp_bounded = [tolerance](const T& a, const T& b, uint32_t /*i*/) -> bool {
+        const int32_t ia = __float_as_int(static_cast<float>(a));
+        const int32_t ib = __float_as_int(static_cast<float>(b));
+        // Convert to biased representation for monotonic distance
+        const int32_t ba = (ia < 0) ? (0x7FFFFFFF - ia) : ia;
+        const int32_t bb = (ib < 0) ? (0x7FFFFFFF - ib) : ib;
+        int32_t ulp_diff = ba - bb;
+        if (ulp_diff < 0) ulp_diff = -ulp_diff;
+        return static_cast<float>(ulp_diff) > tolerance;
+    };
+
+    // Lambda: relative error comparison.
+    // Mismatch iff |a-b| / max(|a|, ε) exceeds tolerance.
+    auto f_relative = [tolerance](const T& a, const T& b, uint32_t /*i*/) -> bool {
+        const float fa = static_cast<float>(a);
+        const float fb = static_cast<float>(b);
+        const float rel = fabsf(fa - fb) / fmaxf(fabsf(fa), 1e-10f);
+        return rel > tolerance;
+    };
+
+    // Dispatch — mirrors CUB's if(early_stop) / else if(out_buf) / else
+    switch (mode)
     {
-        atomicAdd(&d_report->mismatched_elements, local_mismatches);
-        atomicMax(reinterpret_cast<int*>(&d_report->max_abs_diff),
-                  __float_as_int(local_abs_max));
-        atomicMax(reinterpret_cast<int*>(&d_report->max_rel_diff),
-                  __float_as_int(local_rel_max));
-        atomicMin(&d_report->first_mismatch_idx, local_first_idx);
+    case CompareMode::BITWISE:
+        compare_range<T, BLOCK_THREADS>(d_output_a, d_output_b, num_elements,
+                                         f_bitwise, d_report);
+        break;
+    case CompareMode::ULP_BOUNDED:
+        compare_range<T, BLOCK_THREADS>(d_output_a, d_output_b, num_elements,
+                                         f_ulp_bounded, d_report);
+        break;
+    case CompareMode::RELATIVE:
+        compare_range<T, BLOCK_THREADS>(d_output_a, d_output_b, num_elements,
+                                         f_relative, d_report);
+        break;
     }
 }
 
@@ -142,9 +246,9 @@ __global__ void BitwiseCompareKernel(
 //  so the fuzzer can sweep the parameter space.
 // ─────────────────────────────────────────────────────────────────
 
-/// Deterministic pattern fill: value at index i is derived from
-/// i via a bijective function so that any reordering or truncation
-/// is detectable in the output.
+// Deterministic pattern fill: value at index i is derived from
+// i via a bijective function so that any reordering or truncation
+// is detectable in the output.
 template <typename T>
 __global__ void FillDeterministicPattern(
     T*       __restrict__ d_buf,
@@ -163,12 +267,12 @@ __global__ void FillDeterministicPattern(
     }
 }
 
-/// Generate boundary-condition index arrays.
-/// Produces indices that hit:
-///   - First and last rows (boundary)
-///   - Rows at power-of-2 offsets (alignment stress)
-///   - Repeated indices (atomics stress)
-///   - Sequential runs (coalescing)
+// Generate boundary-condition index arrays.
+// Produces indices that hit:
+//   - First and last rows (boundary)
+//   - Rows at power-of-2 offsets (alignment stress)
+//   - Repeated indices (atomics stress)
+//   - Sequential runs (coalescing)
 __global__ void GenerateBoundaryIndices(
     size_t*  __restrict__ d_indices,
     size_t                num_indices,

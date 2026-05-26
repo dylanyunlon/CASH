@@ -3,25 +3,25 @@
 #ifndef CRUCIBLE_INDEX_KERNEL_HARNESS_CUH
 #define CRUCIBLE_INDEX_KERNEL_HARNESS_CUH
 
-/// Crucible Index Kernel Test Harness
-///
-/// Wraps HypeReca's three index kernels (indexGet, indexPut, indexCopy)
-/// for cross-architecture differential testing.  Each wrapper:
-///
-///   1. Allocates deterministic input on the target device
-///   2. Launches the kernel with a given configuration
-///   3. Captures the output for comparison
-///
-/// The harness exercises the kernels at architecture-sensitive
-/// boundary conditions:
-///
-///   - Embedding dimensions at warp-width multiples (32, 64, 128)
-///     vs non-aligned (33, 65, 129)
-///   - Row counts at block-boundary edges
-///   - Mixed alignment of input/output buffer base addresses
-///
-/// These are the same kernels that Alloy's TieredEmbedding depends on,
-/// so Crucible validates them before Alloy trusts their output.
+// Crucible Index Kernel Test Harness
+//
+// Wraps HypeReca's three index kernels (indexGet, indexPut, indexCopy)
+// for cross-architecture differential testing.  Each wrapper:
+//
+//   1. Allocates deterministic input on the target device
+//   2. Launches the kernel with a given configuration
+//   3. Captures the output for comparison
+//
+// The harness exercises the kernels at architecture-sensitive
+// boundary conditions:
+//
+//   - Embedding dimensions at warp-width multiples (32, 64, 128)
+//     vs non-aligned (33, 65, 129)
+//   - Row counts at block-boundary edges
+//   - Mixed alignment of input/output buffer base addresses
+//
+// These are the same kernels that Alloy's TieredEmbedding depends on,
+// so Crucible validates them before Alloy trusts their output.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -81,10 +81,10 @@ struct IndexKernelTestConfig {
     size_t alignment_offset; // byte offset to stress alignment
     uint64_t seed;          // deterministic fill seed
 
-    /// Compute the HypeReca-style launch config:
-    ///   blockDim.x = embedding_dim
-    ///   blockDim.y = 512 / embedding_dim (rows per block)
-    ///   gridDim.x  = ceil(batch_size / blockDim.y)
+    // Compute the HypeReca-style launch config:
+    //   blockDim.x = embedding_dim
+    //   blockDim.y = 512 / embedding_dim (rows per block)
+    //   gridDim.x  = ceil(batch_size / blockDim.y)
     void get_launch_config(dim3& grid, dim3& block) const
     {
         const int per_block = 512 / static_cast<int>(embedding_dim);
@@ -101,8 +101,8 @@ struct IndexKernelTestConfig {
 
 struct IndexKernelHarness {
 
-    /// Run indexGetKernel on a specific device and return the output.
-    /// Caller must free d_output.
+    // Run indexGetKernel on a specific device and return the output.
+    // Caller must free d_output.
     template <typename DataType>
     static void run_index_get(
         int                        device_id,
@@ -150,7 +150,7 @@ struct IndexKernelHarness {
         cudaFree(d_indices);
     }
 
-    /// Run indexPutKernel on a specific device.
+    // Run indexPutKernel on a specific device.
     template <typename DataType>
     static void run_index_put(
         int                        device_id,
@@ -195,7 +195,7 @@ struct IndexKernelHarness {
         cudaFree(d_indices);
     }
 
-    /// Run indexCopyKernel on a specific device.
+    // Run indexCopyKernel on a specific device.
     template <typename DataType>
     static void run_index_copy(
         int                        device_id,
@@ -291,10 +291,13 @@ struct IndexKernelHarness {
         cudaMemset(d_report, 0, sizeof(DivergenceReport));
 
         const int cmp_grid = static_cast<int>((out_elems + 255) / 256);
-        BitwiseCompareKernel<DataType, 256><<<cmp_grid, 256>>>(
+        // DifferentialCompareKernel replaces BitwiseCompareKernel with mode selection
+        DifferentialCompareKernel<DataType, 256><<<cmp_grid, 256>>>(
             d_out_a, d_out_b_copy,
             static_cast<uint32_t>(out_elems),
-            d_report);
+            d_report,
+            CompareMode::BITWISE,
+            0.0f);
 
         DivergenceReport report;
         cudaMemcpy(&report, d_report, sizeof(DivergenceReport),
@@ -338,8 +341,8 @@ struct BoundaryTestSuite {
     static constexpr size_t NUM_DIMS = sizeof(EMBEDDING_DIMS) / sizeof(size_t);
     static constexpr size_t NUM_ROWS = sizeof(ROW_COUNTS) / sizeof(size_t);
 
-    /// Generate all (dim × row_count) configurations.
-    /// Returns total count; fills configs[0..count-1].
+    // Generate all (dim × row_count) configurations.
+    // Returns total count; fills configs[0..count-1].
     static size_t generate(IndexKernelTestConfig* configs, size_t max_configs)
     {
         size_t count = 0;

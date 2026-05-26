@@ -3,22 +3,22 @@
 #ifndef CRUCIBLE_ARCH_DISPATCH_CUH
 #define CRUCIBLE_ARCH_DISPATCH_CUH
 
-/// Crucible Architecture-Aware Kernel Dispatch
-///
-/// The same CUDA kernel compiled for sm86 (A6000) and sm90 (H100)
-/// can produce different results due to:
-///
-///   1. Different shared memory limits (48KB vs 228KB)
-///   2. Different warp scheduling policies
-///   3. FP8 hardware only on sm90
-///   4. Asynchronous copy semantics (cp.async.bulk on sm90)
-///   5. Thread Block Cluster (sm90 only)
-///
-/// This header provides:
-///   - Compile-time architecture traits
-///   - Runtime architecture detection
-///   - Arch-dependent kernel configuration
-///   - Shared memory limit enforcement
+// Crucible Architecture-Aware Kernel Dispatch
+//
+// The same CUDA kernel compiled for sm86 (A6000) and sm90 (H100)
+// can produce different results due to:
+//
+//   1. Different shared memory limits (48KB vs 228KB)
+//   2. Different warp scheduling policies
+//   3. FP8 hardware only on sm90
+//   4. Asynchronous copy semantics (cp.async.bulk on sm90)
+//   5. Thread Block Cluster (sm90 only)
+//
+// This header provides:
+//   - Compile-time architecture traits
+//   - Runtime architecture detection
+//   - Arch-dependent kernel configuration
+//   - Shared memory limit enforcement
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -138,7 +138,7 @@ struct KernelLaunchConfig {
         DEVICE_MISMATCH
     };
 
-    /// Validate this config against a detected device architecture.
+    // Validate this config against a detected device architecture.
     Validity validate(const DeviceArch& arch) const
     {
         const int total_threads = block.x * block.y * block.z;
@@ -157,8 +157,8 @@ struct KernelLaunchConfig {
         return Validity::OK;
     }
 
-    /// Clamp this config to be valid on the given architecture.
-    /// Returns true if clamping was needed (i.e., original was invalid).
+    // Clamp this config to be valid on the given architecture.
+    // Returns true if clamping was needed (i.e., original was invalid).
     bool clamp_to_arch(const DeviceArch& arch)
     {
         bool clamped = false;

@@ -27,7 +27,7 @@ class CrucibleRuntime {
 public:
     CrucibleRuntime() { memset(&influence_, 0, sizeof(influence_)); }
 
-    /// Detect all GPUs and classify by architecture.
+    // Detect all GPUs and classify by architecture.
     void detect()
     {
         int num_devices = 0;
@@ -56,7 +56,7 @@ public:
         influence_.reset();
     }
 
-    /// Calibrate each device with lookup and scatter micro-benchmarks.
+    // Calibrate each device with lookup and scatter micro-benchmarks.
     void calibrate(size_t num_rows = 100000, size_t dim = 128,
                    size_t num_probes = 50000)
     {
@@ -140,9 +140,9 @@ public:
         }
     }
 
-    /// Run one differential fuzzing round.
-    /// Tests a kernel wrapper on all sm86/sm90 device pairs.
-    /// Returns number of divergences found.
+    // Run one differential fuzzing round.
+    // Tests a kernel wrapper on all sm86/sm90 device pairs.
+    // Returns number of divergences found.
     template <typename KernelFunc>
     int fuzz_round(
         KernelFunc           kernel_fn,
@@ -218,10 +218,12 @@ public:
             cudaMemset(d_report, 0, sizeof(DivergenceReport));
 
             const int cmp_grid = static_cast<int>((num_rows * dim + 255) / 256);
-            BitwiseCompareKernel<float, 256><<<cmp_grid, 256>>>(
+            DifferentialCompareKernel<float, 256><<<cmp_grid, 256>>>(
                 d_out_a, d_out_b_copy,
                 static_cast<uint32_t>(num_rows * dim),
-                d_report);
+                d_report,
+                CompareMode::BITWISE,
+                0.0f);
 
             DivergenceReport report;
             cudaMemcpy(&report, d_report, sizeof(DivergenceReport), cudaMemcpyDeviceToHost);
@@ -257,7 +259,7 @@ public:
         return divergences;
     }
 
-    /// Compute optimal workload partition.
+    // Compute optimal workload partition.
     PartitionPlan partition(size_t num_lookups, size_t num_scatters) const
     {
         return solve_partition(profiles_.data(),
@@ -265,7 +267,7 @@ public:
                               num_lookups, num_scatters);
     }
 
-    /// Compute uniform partition (for comparison).
+    // Compute uniform partition (for comparison).
     PartitionPlan partition_uniform(size_t num_lookups, size_t num_scatters) const
     {
         return solve_uniform(profiles_.data(),
