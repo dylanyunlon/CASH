@@ -182,11 +182,19 @@ class BoundaryTensorGenerator:
     def generate_boundary_configs(cls, num_configs: int = 100,
                                    influence_guide: Optional[InfluenceGuide] = None
                                    ) -> List[KernelConfig]:
-        """Generate kernel configs at architecture boundary values."""
+        """
+        Generate kernel configs at architecture boundary values.
+        
+        C008: Now includes FP8 and BF16 dtypes in addition to FP32.
+        C009: When influence_guide is provided, bias toward high-influence
+              parameter regions via weighted sampling.
+        """
         configs = []
         
+        # C008: Multiple dtypes — FP8 is sm90-only, triggers arch divergence
+        dtypes = [torch.float32, torch.bfloat16, torch.float16]
+        
         # ── Shared memory boundaries (biggest divergence source) ──
-        # sm86 max = 48KB, sm90 can go up to 228KB
         shared_mem_values = [0, 1024, 48 * 1024, 49152, 49153,  # At sm86 boundary
                             64 * 1024, 100 * 1024, 164 * 1024, 228 * 1024]
         
@@ -199,21 +207,35 @@ class BoundaryTensorGenerator:
         shape_dims = [1, 3, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65,
                       127, 128, 129, 255, 256, 257, 511, 512, 1024, 1025]
         
-        for smem in shared_mem_values:
-            for block in block_sizes[:3]:  # Limit combinations
-                for dim0 in shape_dims[:5]:
-                    for alignment in [1, 4, 16, 64, 128]:
-                        grid = (max(1, 1024 // block[0]), 1, 1)
-                        configs.append(KernelConfig(
-                            grid_dim=grid,
-                            block_dim=block,
-                            shared_mem_bytes=smem,
-                            data_alignment=alignment,
-                            tensor_shape=(dim0, 128),
-                            dtype=torch.float32
-                        ))
-                        if len(configs) >= num_configs:
-                            return configs
+        # C009: If influence_guide exists, use scores to weight parameter selection
+        if influence_guide and influence_guide._total_updates > 10:
+            scores = influence_guide.param_scores
+            # Bias shared_mem if high influence
+            if scores.get('shared_mem', 0.5) > 0.7:
+                shared_mem_values = shared_mem_values + [
+                    48 * 1024 - 1, 48 * 1024 + 1,  # tighter boundary
+                    100 * 1024 - 1, 100 * 1024 + 1,
+                ]
+            # Bias shape if high influence
+            if scores.get('shape_0', 0.5) > 0.7:
+                shape_dims = shape_dims + [2, 4, 5, 6, 9, 10, 17, 30, 34]
+        
+        for dtype in dtypes:
+            for smem in shared_mem_values:
+                for block in block_sizes[:3]:
+                    for dim0 in shape_dims[:5]:
+                        for alignment in [1, 4, 16, 64, 128]:
+                            grid = (max(1, 1024 // block[0]), 1, 1)
+                            configs.append(KernelConfig(
+                                grid_dim=grid,
+                                block_dim=block,
+                                shared_mem_bytes=smem,
+                                data_alignment=alignment,
+                                tensor_shape=(dim0, 128),
+                                dtype=dtype
+                            ))
+                            if len(configs) >= num_configs:
+                                return configs
         
         return configs[:num_configs]
 
@@ -342,6 +364,9 @@ class CrucibleFuzzer:
             'divergence_rate': len(self.divergences) / max(len(self.results), 1),
             'high_influence_params': self.influence.get_high_influence_params(),
             'influence_scores': self.influence.param_scores,
+            'influence_summary': self.influence.get_summary(),
+            # C010: Per-dtype divergence breakdown
+            'per_dtype_divergences': self._compute_dtype_breakdown(),
             'divergence_details': [
                 {
                     'config': d.config.to_dict(),
@@ -354,3 +379,21 @@ class CrucibleFuzzer:
         }
         
         return report
+    
+    def _compute_dtype_breakdown(self) -> Dict:
+        """C010: Compute divergence rate per dtype for the campaign."""
+        dtype_counts = {}
+        dtype_divs = {}
+        for r in self.results:
+            dt = str(r.config.dtype)
+            dtype_counts[dt] = dtype_counts.get(dt, 0) + 1
+            if r.is_divergent:
+                dtype_divs[dt] = dtype_divs.get(dt, 0) + 1
+        return {
+            dt: {
+                'total': dtype_counts[dt],
+                'divergent': dtype_divs.get(dt, 0),
+                'rate': dtype_divs.get(dt, 0) / dtype_counts[dt],
+            }
+            for dt in dtype_counts
+        }
