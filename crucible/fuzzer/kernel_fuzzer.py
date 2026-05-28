@@ -308,7 +308,12 @@ class CrucibleFuzzer:
             
             divergence_idx = []
             if is_divergent:
-                divergence_idx = torch.where(abs_diff > 1e-6)[0][:10].tolist()
+                # C015: flatten first. The old code did torch.where(...)[0] on a
+                # multi-dimensional abs_diff, which returns only the dim-0
+                # (row) indices — ambiguous and lossy for 2D+ outputs. Report
+                # flat element indices into the contiguous buffer instead.
+                flat_diff = abs_diff.reshape(-1)
+                divergence_idx = torch.where(flat_diff > 1e-6)[0][:10].tolist()
             
             result = FuzzResult(
                 config=config,

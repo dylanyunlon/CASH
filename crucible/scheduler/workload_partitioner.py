@@ -130,11 +130,6 @@ class DeviceCalibrator:
                     f"lookup={lookup_throughput:.0f}/s, update={update_throughput:.0f}/s")
         
         return profile
-        
-        logger.info(f"Calibrated GPU:{device_id} ({name}): "
-                    f"lookup={lookup_throughput:.0f}/s, update={update_throughput:.0f}/s")
-        
-        return profile
 
 
 class LoadAwarePartitioner:

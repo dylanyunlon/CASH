@@ -29,6 +29,11 @@
 #include <cstdint>
 #include <cstddef>
 
+// C019: single source of truth for ULP. f_ulp_bounded must use the same
+// float->ordered-key map (Crucible::ulp_distance) as the ULP analyzer rather
+// than a private, inconsistent copy.
+#include "ulp_analyzer.cuh"
+
 namespace Crucible {
 
 // ─────────────────────────────────────────────────────────────────
@@ -194,15 +199,19 @@ __global__ void DifferentialCompareKernel(
 
     // Lambda: ULP-bounded comparison.
     // Mismatch iff ULP distance exceeds tolerance.
+    //
+    // C019: delegate to the canonical Crucible::ulp_distance from
+    // ulp_analyzer.cuh. The previous inline form used a *different* biasing
+    // (`(ia<0)?0x7FFFFFFF-ia:ia`) that (a) left positives unbiased and
+    // negatives in a disjoint range — non-monotonic across sign — and
+    // (b) computed the difference in int32, which overflows for ia near
+    // INT_MIN. Using the shared primitive guarantees one consistent ULP
+    // definition across every kernel and the Python mirror, and the distance
+    // is accumulated in uint64 so it cannot overflow. NaN yields UINT64_MAX,
+    // which exceeds any finite tolerance (correctly flagged as a mismatch).
     auto f_ulp_bounded = [tolerance](const T& a, const T& b, uint32_t /*i*/) -> bool {
-        const int32_t ia = __float_as_int(static_cast<float>(a));
-        const int32_t ib = __float_as_int(static_cast<float>(b));
-        // Convert to biased representation for monotonic distance
-        const int32_t ba = (ia < 0) ? (0x7FFFFFFF - ia) : ia;
-        const int32_t bb = (ib < 0) ? (0x7FFFFFFF - ib) : ib;
-        int32_t ulp_diff = ba - bb;
-        if (ulp_diff < 0) ulp_diff = -ulp_diff;
-        return static_cast<float>(ulp_diff) > tolerance;
+        const uint64_t ulp = ulp_distance(static_cast<float>(a), static_cast<float>(b));
+        return static_cast<double>(ulp) > static_cast<double>(tolerance);
     };
 
     // Lambda: relative error comparison.

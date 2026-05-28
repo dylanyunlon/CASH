@@ -42,12 +42,24 @@ namespace Crucible {
 __device__ __forceinline__
 int64_t float_to_biased_int(float x)
 {
-    int32_t ix = __float_as_int(x);
-    // Negative floats: flip all bits except sign
-    // This makes the integer representation monotonic across ±0
-    if (ix < 0)
-        ix = 0x80000000 - ix;
-    return static_cast<int64_t>(ix);
+    // Map the IEEE-754 bit pattern to a monotonic unsigned key so that the
+    // entire float line (−∞ … −0, +0 … +∞) becomes a single increasing total
+    // order and |key(a) − key(b)| equals the number of representable floats
+    // between a and b.
+    //
+    //   positives (sign bit 0): flip the sign bit       -> rank above all negatives
+    //   negatives (sign bit 1): flip every bit (~)      -> reverse their descending order
+    //
+    // i.e. key = bits ^ ((bits >> 31) ? 0xFFFFFFFF : 0x80000000).
+    //
+    // The previous `0x80000000 - ix` form was broken: 0x80000000 is INT_MIN as
+    // a signed literal, the subtraction overflowed, and the negative half kept
+    // its descending order (−2.0 ranked above −1.0). Sign-crossing distances
+    // and −0.0 vs +0.0 were therefore meaningless. This formulation cannot
+    // overflow (all math in uint32) and is the standard radix-sort float key.
+    const uint32_t bits = static_cast<uint32_t>(__float_as_int(x));
+    const uint32_t mask = (bits >> 31) ? 0xFFFFFFFFu : 0x80000000u;
+    return static_cast<int64_t>(bits ^ mask);
 }
 
 __device__ __forceinline__
