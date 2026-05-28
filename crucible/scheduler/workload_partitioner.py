@@ -130,6 +130,11 @@ class DeviceCalibrator:
                     f"lookup={lookup_throughput:.0f}/s, update={update_throughput:.0f}/s")
         
         return profile
+        
+        logger.info(f"Calibrated GPU:{device_id} ({name}): "
+                    f"lookup={lookup_throughput:.0f}/s, update={update_throughput:.0f}/s")
+        
+        return profile
 
 
 class LoadAwarePartitioner:
@@ -145,6 +150,17 @@ class LoadAwarePartitioner:
         self.profiles = {p.device_id: p for p in profiles}
         self.total_lookup_throughput = sum(p.embedding_lookup_throughput for p in profiles)
         self.total_update_throughput = sum(p.gradient_update_throughput for p in profiles)
+        # C001: Guard against uncalibrated devices (throughput=0)
+        if self.total_lookup_throughput <= 0:
+            self.total_lookup_throughput = float(len(profiles))
+            for p in profiles:
+                if p.embedding_lookup_throughput <= 0:
+                    p.embedding_lookup_throughput = 1.0
+        if self.total_update_throughput <= 0:
+            self.total_update_throughput = float(len(profiles))
+            for p in profiles:
+                if p.gradient_update_throughput <= 0:
+                    p.gradient_update_throughput = 1.0
     
     def partition_static(self, workload: WorkloadSpec) -> PartitionPlan:
         """
@@ -203,9 +219,13 @@ class LoadAwarePartitioner:
             
             assignments[dev_id] = adjusted_frac
         
-        # Normalize
+        # C002: Normalize (guard against zero-sum from extreme utilization)
         total = sum(assignments.values())
-        assignments = {k: v / total for k, v in assignments.items()}
+        if total <= 0:
+            n = len(assignments)
+            assignments = {k: 1.0 / n for k in assignments}
+        else:
+            assignments = {k: v / total for k, v in assignments.items()}
         
         # Estimate time
         estimated_times = {}

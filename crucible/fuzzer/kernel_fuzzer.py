@@ -69,7 +69,12 @@ class InfluenceGuide:
     Adapts SyzMini's influence scoring to CUDA kernel parameters:
     - Identifies which parameters most influence cross-arch divergence
     - Focuses fuzzing on high-influence parameter regions
+    
+    Uses bounded ring buffer for history to prevent memory leaks
+    during long fuzzing campaigns (C004 fix).
     """
+    
+    MAX_HISTORY = 10000  # Cap history to prevent unbounded growth
     
     def __init__(self):
         self.param_scores: Dict[str, float] = {
@@ -84,6 +89,8 @@ class InfluenceGuide:
             'shape_1': 0.5,
         }
         self._history: List[Tuple[dict, bool]] = []
+        self._total_updates: int = 0
+        self._total_divergences: int = 0
     
     def update(self, config: KernelConfig, caused_divergence: bool):
         """Update influence scores based on observed divergence."""
@@ -98,9 +105,14 @@ class InfluenceGuide:
             'shape_0': config.tensor_shape[0] if len(config.tensor_shape) > 0 else 0,
             'shape_1': config.tensor_shape[1] if len(config.tensor_shape) > 1 else 0,
         }
+        # Ring buffer: drop oldest when full
+        if len(self._history) >= self.MAX_HISTORY:
+            self._history.pop(0)
         self._history.append((params, caused_divergence))
+        self._total_updates += 1
         
         if caused_divergence:
+            self._total_divergences += 1
             # Increase influence score for parameters at boundary values
             for key, val in params.items():
                 if self._is_boundary_value(key, val):
@@ -129,6 +141,17 @@ class InfluenceGuide:
         """Get parameters with highest influence scores."""
         sorted_params = sorted(self.param_scores.items(), key=lambda x: -x[1])
         return [p[0] for p in sorted_params[:top_k]]
+
+    def get_summary(self) -> Dict:
+        """Get influence analysis summary for reporting."""
+        return {
+            'total_updates': self._total_updates,
+            'total_divergences': self._total_divergences,
+            'divergence_rate': (self._total_divergences / max(self._total_updates, 1)),
+            'scores': dict(self.param_scores),
+            'top_3': self.get_high_influence_params(3),
+            'history_size': len(self._history),
+        }
 
 
 class BoundaryTensorGenerator:
@@ -212,27 +235,48 @@ class CrucibleFuzzer:
                     input_data: torch.Tensor) -> FuzzResult:
         """
         Run a kernel on both architectures and compare outputs.
+        Handles: shape mismatches (C003), CPU-only testing (C005).
         """
         try:
             # Run on sm86 (A6000)
             input_a = input_data.to(self.device_a)
-            torch.cuda.synchronize(self.device_a)
+            if self.device_a.type == 'cuda':
+                torch.cuda.synchronize(self.device_a)
             start_a = time.perf_counter()
             output_a = kernel_fn(input_a, config)
-            torch.cuda.synchronize(self.device_a)
+            if self.device_a.type == 'cuda':
+                torch.cuda.synchronize(self.device_a)
             time_a = (time.perf_counter() - start_a) * 1000
             
             # Run on sm90 (H100)
             input_b = input_data.to(self.device_b)
-            torch.cuda.synchronize(self.device_b)
+            if self.device_b.type == 'cuda':
+                torch.cuda.synchronize(self.device_b)
             start_b = time.perf_counter()
             output_b = kernel_fn(input_b, config)
-            torch.cuda.synchronize(self.device_b)
+            if self.device_b.type == 'cuda':
+                torch.cuda.synchronize(self.device_b)
             time_b = (time.perf_counter() - start_b) * 1000
             
             # Compare outputs
             out_a_cpu = output_a.float().cpu()
             out_b_cpu = output_b.float().cpu()
+            
+            # C003: Shape mismatch is itself a divergence
+            if out_a_cpu.shape != out_b_cpu.shape:
+                result = FuzzResult(
+                    config=config,
+                    arch_a_output=out_a_cpu, arch_b_output=out_b_cpu,
+                    arch_a_time_ms=time_a, arch_b_time_ms=time_b,
+                    is_divergent=True,
+                    max_abs_diff=float('inf'),
+                    max_rel_diff=float('inf'),
+                    error=f"Shape mismatch: {out_a_cpu.shape} vs {out_b_cpu.shape}"
+                )
+                self.influence.update(config, True)
+                self.results.append(result)
+                self.divergences.append(result)
+                return result
             
             abs_diff = (out_a_cpu - out_b_cpu).abs()
             max_abs = abs_diff.max().item()
